@@ -14,6 +14,7 @@ import {
   AlertTriangle,
   ArrowLeft,
   Check,
+  CheckCircle2,
   ChevronLeft,
   ChevronRight,
   ClipboardCheck,
@@ -22,20 +23,26 @@ import {
   FileCheck2,
   FileText,
   Highlighter,
+  History,
   Layers3,
+  Lock,
   Menu,
   PanelLeftClose,
+  RefreshCw,
   ScanSearch,
   ShieldCheck,
   Stamp,
   Tags,
-  UploadCloud
+  Unlock,
+  UploadCloud,
+  User,
+  XCircle
 } from 'lucide-react';
 import * as pdfjs from 'pdfjs-dist';
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import { Badge, Button, Card, Dialog, Tabs, X } from './components/ui';
-import { useDisclosureStore, type DisclosureRecord } from './store';
+import { useDisclosureStore, docBaseline, type DisclosureRecord } from './store';
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -46,6 +53,35 @@ const bundleQuery = async () => ({
     { id: 'Q-33', name: '专家报告附件', count: 19, owner: '顾言', progress: 91, due: '09-30 18:00' }
   ]
 });
+
+function ToastHost() {
+  const toasts = useDisclosureStore((state) => state.toasts);
+  const dismissToast = useDisclosureStore((state) => state.dismissToast);
+  useEffect(() => {
+    if (toasts.length === 0) return;
+    const timers = toasts.map((t) => setTimeout(() => dismissToast(t.id), 6000));
+    return () => timers.forEach(clearTimeout);
+  }, [toasts, dismissToast]);
+  if (toasts.length === 0) return null;
+  return (
+    <div className="toast-host">
+      {toasts.map((t) => (
+        <div key={t.id} className={`toast ${t.kind}`} onClick={() => dismissToast(t.id)}>
+          {t.kind === 'conflict' ? <XCircle size={15} /> : t.kind === 'success' ? <CheckCircle2 size={15} /> : t.kind === 'warn' ? <AlertTriangle size={15} /> : <ShieldCheck size={15} />}
+          <span>{t.message}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function RevisionBadge({ revision }: { revision: number }) {
+  return <Badge tone="blue">修订 r{revision}</Badge>;
+}
+
+function StaleNote({ children }: { children: React.ReactNode }) {
+  return <span className="stale-note"><AlertTriangle size={12} /> {children}</span>;
+}
 
 function AppShell() {
   const [mobileNav, setMobileNav] = useState(false);
@@ -88,6 +124,7 @@ function AppShell() {
         </aside>
         <main className="main-content"><Outlet /></main>
       </div>
+      <ToastHost />
     </div>
   );
 }
@@ -256,7 +293,7 @@ function PdfPage({ pageNumber, redacted = false, onDraw }: { pageNumber: number;
 function ReviewPage() {
   const { documentId } = useParams({ from: '/review/$documentId' });
   const navigate = useNavigate();
-  const { documents, activePage, redactionMode, activeRedactionId } = useDisclosureStore();
+  const { documents, activePage, redactionMode, activeRedactionId, pendingWrites } = useDisclosureStore();
   const store = useDisclosureStore();
   const doc = documents.find((item) => item.id === documentId) ?? documents[0];
   const pageRegions = doc.redactions.filter((item) => item.page === activePage);
@@ -264,12 +301,23 @@ function ReviewPage() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [reason, setReason] = useState('商业秘密');
   const [privilege, setPrivilege] = useState('合同保密');
+
+  // 确认时依据的修订：选中区域时记录，用于先到者生效判定
+  const baseRevisionRef = useRef(doc.revision);
+  useEffect(() => {
+    baseRevisionRef.current = doc.revision;
+  }, [activeRedactionId, documentId]);
+
+  const pendingConfirm = pendingWrites.find((w) => w.kind === 'confirm' && w.documentId === doc.id);
+  const confirmedCount = doc.redactions.filter((item) => item.status === 'confirmed' && item.confirmedRevision === doc.revision).length;
+
   return (
     <div className="page review-page">
       <header className="review-header">
         <div className="review-title">
           <Button variant="ghost" onClick={() => navigate({ to: '/' })}><ArrowLeft size={16} /></Button>
           <div><small>{doc.id} / 去密审阅</small><h1>{doc.title}</h1></div>
+          <RevisionBadge revision={doc.revision} />
           <Badge tone={doc.classification === '严格机密' ? 'red' : 'amber'}>{doc.classification}</Badge>
         </div>
         <div className="review-actions">
@@ -293,35 +341,60 @@ function ReviewPage() {
             <div><button onClick={() => store.setPage(Math.max(1, activePage - 1))} disabled={activePage === 1}><ChevronLeft size={16} /></button><strong>{activePage} / {doc.pages}</strong><button onClick={() => store.setPage(Math.min(doc.pages, activePage + 1))} disabled={activePage === doc.pages}><ChevronRight size={16} /></button></div>
             <span>125%</span>
             <span>原页 · 掩码叠加</span>
+            <span className="revision-hint">确认依据修订 r{baseRevisionRef.current} · 已确认 {confirmedCount}/{doc.redactions.length}</span>
           </div>
           <div className="pdf-stage">
             <PdfPage
               pageNumber={activePage}
               onDraw={redactionMode ? (region) => store.addRedaction({ ...region, page: activePage, reason, privilege }) : undefined}
             />
-            {pageRegions.map((region) => (
-              <button
-                key={region.id}
-                className={`redaction-region ${region.status} ${activeRedactionId === region.id ? 'selected' : ''}`}
-                style={{ left: `${region.x * 100}%`, top: `${region.y * 100}%`, width: `${region.width * 100}%`, height: `${region.height * 100}%` }}
-                onClick={() => store.selectRedaction(region.id)}
-                title={`${region.reason} / ${region.privilege}`}
-              />
-            ))}
+            {pageRegions.map((region) => {
+              const stale = region.status === 'draft' && region.confirmedRevision !== undefined && region.confirmedRevision < doc.revision;
+              return (
+                <button
+                  key={region.id}
+                  className={`redaction-region ${region.status} ${activeRedactionId === region.id ? 'selected' : ''} ${stale ? 'stale' : ''}`}
+                  style={{ left: `${region.x * 100}%`, top: `${region.y * 100}%`, width: `${region.width * 100}%`, height: `${region.height * 100}%` }}
+                  onClick={() => store.selectRedaction(region.id)}
+                  title={`${region.reason} / ${region.privilege}`}
+                />
+              );
+            })}
           </div>
         </section>
         <aside className="inspector">
           <div className="side-label">区域属性</div>
           {active ? (
             <>
-              <div className="inspector-title"><strong>{active.reason}</strong><Badge tone={active.status === 'confirmed' ? 'green' : 'amber'}>{active.status === 'confirmed' ? '已确认' : '草稿'}</Badge></div>
+              <div className="inspector-title">
+                <strong>{active.reason}</strong>
+                {active.status === 'confirmed' && active.confirmedRevision === doc.revision
+                  ? <Badge tone="green">已确认 r{active.confirmedRevision}</Badge>
+                  : active.status === 'draft' && active.confirmedRevision !== undefined && active.confirmedRevision < doc.revision
+                    ? <Badge tone="amber">待复核</Badge>
+                    : <Badge tone="amber">草稿</Badge>}
+              </div>
+              {active.status === 'draft' && active.confirmedRevision !== undefined && active.confirmedRevision < doc.revision && (
+                <div className="stale-banner"><StaleNote>曾确认于 r{active.confirmedRevision}，内容已变更至 r{doc.revision}，需重新确认。</StaleNote></div>
+              )}
               <label>保密级别<select value={doc.classification} onChange={(event) => store.updateClassification(event.target.value as DisclosureRecord['classification'])}><option>内部</option><option>机密</option><option>严格机密</option></select></label>
               <label>去密原因<input value={active.reason} readOnly /></label>
               <label>特权标签<input value={active.privilege} readOnly /></label>
               <label>责任人员<input value={doc.owner} readOnly /></label>
               <div className="coordinate-grid"><div><span>X</span><b>{Math.round(active.x * 100)}%</b></div><div><span>Y</span><b>{Math.round(active.y * 100)}%</b></div><div><span>宽</span><b>{Math.round(active.width * 100)}%</b></div><div><span>高</span><b>{Math.round(active.height * 100)}%</b></div></div>
-              <Button onClick={() => store.confirmRedaction(active.id)} disabled={active.status === 'confirmed'}><Check size={15} /> 确认此区域</Button>
+              <Button
+                onClick={() => store.confirmRedaction(active.id, baseRevisionRef.current)}
+                disabled={active.status === 'confirmed' && active.confirmedRevision === doc.revision}
+              ><Check size={15} /> 确认此区域（依据 r{baseRevisionRef.current}）</Button>
+              <Button variant="outline" onClick={() => active && store.simulateTeammateConfirm(doc.id, active.id)} disabled={active.status === 'confirmed' && active.confirmedRevision === doc.revision}><User size={15} /> 模拟队友先提交</Button>
               <Button variant="outline"><Copy size={15} /> 批量复制到同类页</Button>
+              {pendingConfirm && (
+                <div className="retry-banner">
+                  <RefreshCw size={14} />
+                  <span>与队友提交冲突，草稿已保留（依据 r{pendingConfirm.baseRevision}）。</span>
+                  <Button variant="outline" onClick={() => store.retryWrite(pendingConfirm.id)}><RefreshCw size={13} /> 重试</Button>
+                </div>
+              )}
             </>
           ) : <p className="muted">在文档页面上选择一个去密区域查看属性。</p>}
           <div className="rule-note"><AlertTriangle size={16} /><span>发布版本不得包含原始文本层或图片残片。</span></div>
@@ -335,7 +408,7 @@ function ReviewPage() {
             <Dialog.Description>系统将核对原始页与发布页的一致性，并检查元数据残留。</Dialog.Description>
             <div className="dialog-checks">
               <p><Check /> {doc.redactions.length} 个去密区域已定位</p>
-              <p><Check /> 文档版本与操作者记录完整</p>
+              <p><Check /> 文档版本与操作者记录完整（当前修订 r{doc.revision}）</p>
               <p className={doc.redactions.some((item) => item.status === 'draft') ? 'failed' : ''}><AlertTriangle /> {doc.redactions.some((item) => item.status === 'draft') ? '仍有未确认区域' : '所有区域已确认'}</p>
             </div>
             <Dialog.Close asChild><Button>返回检查 <X size={15} /></Button></Dialog.Close>
@@ -347,51 +420,238 @@ function ReviewPage() {
 }
 
 function QualityPage() {
-  const { documents } = useDisclosureStore();
+  const { documents, batches, activeBatchId, reviewChecks, metadataCleaned, pendingWrites } = useDisclosureStore();
   const store = useDisclosureStore();
-  const doc = documents[1];
+  const activeBatch = batches.find((b) => b.id === activeBatchId) ?? batches[0];
+  const batchDocs = activeBatch.documentIds
+    .map((id) => documents.find((d) => d.id === id))
+    .filter((d): d is DisclosureRecord => !!d);
+  const [selectedDocId, setSelectedDocId] = useState<string>(batchDocs[0]?.id ?? '');
+  const doc = documents.find((d) => d.id === selectedDocId) ?? batchDocs[0];
+
+  // 质检依据的修订：切换文档/批次时记录
+  const baseRevisionRef = useRef(doc?.revision ?? 1);
+  useEffect(() => {
+    baseRevisionRef.current = doc?.revision ?? 1;
+  }, [selectedDocId, activeBatchId]);
+
   const checks = [
     { id: 'forbidden-terms', label: '全文禁词与姓名复核', detail: '扫描原始页和发布页文本层' },
     { id: 'page-number', label: '页序与页码连续性', detail: '检查拆页、合并及漏页情况' },
     { id: 'image-boundary', label: '图像边界残片', detail: '逐页比较遮蔽边界 2mm 区域' },
     { id: 'metadata', label: '文档元数据清理', detail: '作者、修订人、批注和隐藏字段' }
   ];
+
+  if (!doc) return <div className="page"><p className="muted">请先在批次中加入文档。</p></div>;
+
+  const baseline = docBaseline(activeBatch, doc);
+  const confirmedAtRevision = doc.redactions.filter((r) => r.status === 'confirmed' && r.confirmedRevision === doc.revision).length;
+  const pendingQc = pendingWrites.find((w) => w.kind === 'qc' && w.batchId === activeBatch.id && w.documentId === doc.id);
+  const allChecksDone = Object.values(reviewChecks).every(Boolean) && metadataCleaned;
+
   return (
     <div className="page">
-      <header className="page-heading"><div><small>QUALITY ASSURANCE / SIDE-BY-SIDE</small><h1>发布质控双人复核</h1><p>并排检查原始页与发布页，所有差异必须留下复核结论。</p></div><Button><FileCheck2 size={16} /> 导出发布清单</Button></header>
+      <header className="page-heading"><div><small>QUALITY ASSURANCE / SIDE-BY-SIDE</small><h1>发布质控双人复核</h1><p>并排检查原始页与发布页，所有差异必须留下绑定修订的复核结论。</p></div>
+        <div className="batch-select">
+          <label>质检批次</label>
+          <select value={activeBatch.id} onChange={(e) => store.setActiveBatch(e.target.value)}>
+            {batches.map((b) => <option key={b.id} value={b.id}>{b.id} · {b.name}{b.manifest ? '（已冻结）' : ''}</option>)}
+          </select>
+        </div>
+      </header>
+
+      {activeBatch.manifest && (
+        <div className="frozen-banner">
+          <Lock size={15} />
+          <span>批次 {activeBatch.id} 清单已于 {activeBatch.manifest.issuedAt} 冻结发出，质检结论不再变更。</span>
+        </div>
+      )}
+
       <div className="comparison-banner">
-        <div><Eye size={17} /><strong>{doc.title}</strong><span>版本 3.4 · 双人复核</span></div>
-        <Badge tone="amber">等待复审员 2/2</Badge>
+        <div><Eye size={17} /><strong>{doc.title}</strong><span>修订 r{doc.revision} · 双人复核</span></div>
+        <div className="banner-badges">
+          <RevisionBadge revision={doc.revision} />
+          {baseline.qcValid
+            ? <Badge tone="green">质检通过 r{baseline.qc?.revision}</Badge>
+            : baseline.qcStale
+              ? <Badge tone="amber">质检失效（依据 r{baseline.qc?.revision}）</Badge>
+              : <Badge tone="amber">等待复审员 2/2</Badge>}
+        </div>
       </div>
+
+      {batchDocs.length > 0 && (
+        <div className="qc-doc-tabs">
+          {batchDocs.map((d) => {
+            const b = docBaseline(activeBatch, d);
+            return (
+              <button key={d.id} className={d.id === doc.id ? 'active' : ''} onClick={() => setSelectedDocId(d.id)}>
+                <span>{d.id}</span>
+                <strong>{d.title}</strong>
+                {b.qcValid ? <Badge tone="green">通过</Badge> : b.qcStale ? <Badge tone="amber">失效</Badge> : <Badge tone="neutral">待质检</Badge>}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
       <div className="compare-grid">
         <Card className="compare-panel"><div className="compare-head"><span>原始页</span><Badge tone="neutral">源文件</Badge></div><div className="compare-page"><PdfPage pageNumber={1} /></div></Card>
         <Card className="compare-panel"><div className="compare-head"><span>发布页</span><Badge tone="green">已遮蔽</Badge></div><div className="compare-page redacted-preview"><PdfPage pageNumber={1} redacted /><div className="demo-mask mask-one" /><div className="demo-mask mask-two" /></div></Card>
       </div>
       <div className="quality-bottom">
         <Card className="checks-card"><div className="card-title"><ClipboardCheck size={17} /><strong>发布前校验项</strong></div>{checks.map((check) => <button className="check-row" key={check.id} onClick={() => store.toggleReviewCheck(check.id)}><span className={store.reviewChecks[check.id] ? 'checked' : ''}>{store.reviewChecks[check.id] && <Check size={13} />}</span><div><strong>{check.label}</strong><small>{check.detail}</small></div></button>)}</Card>
-        <Card className="decision-card"><div className="card-title"><ShieldCheck size={17} /><strong>复核结论</strong></div><p>本批次共有 <b>{doc.redactions.length}</b> 个去密区域，其中已确认 {doc.redactions.filter((item) => item.status === 'confirmed').length} 个。</p><label><input type="checkbox" checked={store.metadataCleaned} onChange={store.toggleMetadata} /> 已确认元数据清理</label><div className="decision-actions"><Button variant="outline"><ArrowLeft size={15} /> 退回补件</Button><Button disabled={!store.metadataCleaned || Object.values(store.reviewChecks).some((value) => !value)} onClick={store.markReady}><Check size={15} /> 通过并标记可发布</Button></div></Card>
+        <Card className="decision-card">
+          <div className="card-title"><ShieldCheck size={17} /><strong>复核结论</strong></div>
+          <p>本批次共有 <b>{doc.redactions.length}</b> 个去密区域，当前修订 r{doc.revision} 下已确认 {confirmedAtRevision} 个。</p>
+          {!baseline.allConfirmed && <div className="stale-banner"><StaleNote>仍有区域未按当前修订 r{doc.revision} 确认，不能通过质检。</StaleNote></div>}
+          {baseline.qcStale && <div className="stale-banner"><StaleNote>质检结论依据 r{baseline.qc?.revision}，内容已变更至 r{doc.revision}，结论失效需重新质检。</StaleNote></div>}
+          <label><input type="checkbox" checked={store.metadataCleaned} onChange={store.toggleMetadata} /> 已确认元数据清理</label>
+          <div className="decision-actions">
+            <Button variant="outline"><ArrowLeft size={15} /> 退回补件</Button>
+            <Button
+              disabled={activeBatch.manifest != null || !allChecksDone || !baseline.allConfirmed}
+              onClick={() => store.submitQc(activeBatch.id, doc.id, 'passed', baseRevisionRef.current)}
+            ><Check size={15} /> 通过并标记可发布（依据 r{baseRevisionRef.current}）</Button>
+          </div>
+          {pendingQc && (
+            <div className="retry-banner">
+              <RefreshCw size={14} />
+              <span>质检提交时内容已变更（依据 r{pendingQc.baseRevision}），草稿已保留。</span>
+              <Button variant="outline" onClick={() => store.retryWrite(pendingQc.id)}><RefreshCw size={13} /> 重试</Button>
+            </div>
+          )}
+        </Card>
       </div>
     </div>
   );
 }
 
 function BatchesPage() {
-  const { documents } = useDisclosureStore();
-  const [selected, setSelected] = useState<string[]>(['DOC-00418']);
-  const activeDoc = documents.find((doc) => doc.id === selected[0]) ?? documents[0];
+  const { documents, batches, activeBatchId } = useDisclosureStore();
+  const store = useDisclosureStore();
+  const activeBatch = batches.find((b) => b.id === activeBatchId) ?? batches[0];
+  const [selected, setSelected] = useState<string[]>(activeBatch?.documentIds ?? []);
+
+  const batchDocs = activeBatch.documentIds
+    .map((id) => documents.find((d) => d.id === id))
+    .filter((d): d is DisclosureRecord => !!d);
+
+  const baselineReady = batchDocs.length > 0 && batchDocs.every((d) => docBaseline(activeBatch, d).ready);
+  const diverged = activeBatch.manifest?.divergedDocuments ?? [];
+
   return (
     <div className="page">
-      <header className="page-heading"><div><small>RELEASE BATCH / TAXONOMY</small><h1>发布批次与标签</h1><p>按案件问题、辖区和披露对象组织文档，生成可追溯发布清单。</p></div><Button>生成发布包</Button></header>
+      <header className="page-heading"><div><small>RELEASE BATCH / TAXONOMY</small><h1>发布批次与标签</h1><p>按案件问题、辖区和披露对象组织文档，生成绑定发布基线的可追溯清单。</p></div>
+        <Button disabled={!baselineReady || !!activeBatch.manifest} onClick={() => store.issueManifest(activeBatch.id)}>
+          {activeBatch.manifest ? <Lock size={16} /> : <Unlock size={16} />}
+          {activeBatch.manifest ? '清单已冻结发出' : '生成发布清单'}
+        </Button>
+      </header>
       <div className="batch-layout">
-        <Card className="batch-list"><div className="card-title"><Layers3 size={17} /><strong>发布批次</strong></div>{['第一批披露 · 审阅中', '第二批披露 · 编制中', '专家材料 · 待补充'].map((name, index) => <button key={name} className={index === 0 ? 'active' : ''}><span>BATCH-{String(index + 1).padStart(2, '0')}</span><strong>{name}</strong><small>{[48, 79, 19][index]} 份文档</small></button>)}</Card>
-        <Card className="batch-content">
-          <div className="card-title"><Tags size={17} /><strong>文档与案件问题映射</strong><span>{selected.length} 已选择</span></div>
-          <div className="batch-table">
-            {documents.map((doc) => <label key={doc.id} className="batch-row"><input type="checkbox" checked={selected.includes(doc.id)} onChange={() => setSelected((ids) => ids.includes(doc.id) ? ids.filter((id) => id !== doc.id) : [...ids, doc.id])} /><FileText size={17} /><div><strong>{doc.title}</strong><span>{doc.id} · {doc.issue}</span></div><Badge tone={doc.status === '可发布' ? 'green' : 'amber'}>{doc.status}</Badge></label>)}
-          </div>
-          <div className="tag-editor"><h3>标签与分发级</h3><div className="tag-options">{(['合同问题', '设备缺陷', '现场安全', '损害赔偿', '仅律师可见']).map((tag, index) => <span key={tag} className={index < 3 ? 'selected' : ''}>{tag}</span>)}</div><label>导出清单说明<textarea defaultValue="按案卷编号升序导出，保留去密版本、操作者与审批时间。" /></label><Button>保存批次设置</Button></div>
+        <Card className="batch-list"><div className="card-title"><Layers3 size={17} /><strong>发布批次</strong></div>
+          {batches.map((batch) => {
+            const docs = batch.documentIds.map((id) => documents.find((d) => d.id === id)).filter((d): d is DisclosureRecord => !!d);
+            const ready = docs.length > 0 && docs.every((d) => docBaseline(batch, d).ready);
+            return (
+              <button key={batch.id} className={batch.id === activeBatch.id ? 'active' : ''} onClick={() => { store.setActiveBatch(batch.id); setSelected(batch.documentIds); }}>
+                <span>{batch.id}</span>
+                <strong>{batch.name}</strong>
+                <small>{docs.length} 份文档 · {batch.manifest ? '已冻结' : ready ? '基线完整' : '待复核'}</small>
+              </button>
+            );
+          })}
         </Card>
-        <Card className="batch-summary"><div className="side-label">当前批次摘要</div><strong>{activeDoc.bundle}</strong><dl><div><dt>文档</dt><dd>{selected.length}</dd></div><div><dt>页数</dt><dd>{selected.reduce((sum, id) => sum + (documents.find((doc) => doc.id === id)?.pages ?? 0), 0)}</dd></div><div><dt>风险项</dt><dd>4</dd></div></dl><div className="summary-note"><AlertTriangle size={15} /><span>发布前仍需完成 4 项双人复核。</span></div></Card>
+        <Card className="batch-content">
+          <div className="card-title">
+            <Tags size={17} /><strong>文档与发布基线</strong>
+            <span>{selected.length} 已选择</span>
+          </div>
+
+          {activeBatch.manifest ? (
+            <div className="frozen-manifest">
+              <div className="frozen-head">
+                <Lock size={16} />
+                <div><strong>已发出清单（冻结）</strong><small>{activeBatch.manifest.batchId} · 发出于 {activeBatch.manifest.issuedAt}</small></div>
+              </div>
+              <div className="batch-table">
+                {activeBatch.manifest.snapshot.map((s) => (
+                  <div className="batch-row" key={s.documentId}>
+                    <FileText size={17} />
+                    <div><strong>{s.title}</strong><span>{s.documentId} · 发出时修订 r{s.revision} · {s.redactionCount} 个区域</span></div>
+                    <Badge tone="neutral">已冻结</Badge>
+                  </div>
+                ))}
+              </div>
+              {diverged.length > 0 && (
+                <div className="diverge-banner">
+                  <AlertTriangle size={15} />
+                  <div>
+                    <strong>发出后内容已变更，影响已标出：</strong>
+                    <ul>
+                      {diverged.map((d) => {
+                        const doc = documents.find((x) => x.id === d.documentId);
+                        return <li key={d.documentId}>{d.documentId}（{doc?.title}）：r{d.fromRevision} → r{d.toRevision}，冻结清单与当前内容分歧。</li>;
+                      })}
+                    </ul>
+                    <span className="diverge-note">冻结清单不再改写；如需按当前内容重新发布，须重新确认并新建批次。</span>
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : (
+            <>
+              <div className="batch-table">
+                {batchDocs.length === 0 && <p className="muted empty-batch">本批次暂无文档。</p>}
+                {batchDocs.map((doc) => {
+                  const b = docBaseline(activeBatch, doc);
+                  const confirmedAtRevision = doc.redactions.filter((r) => r.status === 'confirmed' && r.confirmedRevision === doc.revision).length;
+                  return (
+                    <div className="batch-row" key={doc.id}>
+                      <input type="checkbox" checked={selected.includes(doc.id)} onChange={() => setSelected((ids) => ids.includes(doc.id) ? ids.filter((id) => id !== doc.id) : [...ids, doc.id])} />
+                      <FileText size={17} />
+                      <div>
+                        <strong>{doc.title}</strong>
+                        <span>{doc.id} · {doc.issue} · 修订 r{doc.revision} · 区域 {confirmedAtRevision}/{doc.redactions.length} 已确认</span>
+                      </div>
+                      {b.ready
+                        ? <Badge tone="green">基线完整</Badge>
+                        : b.qcStale
+                          ? <Badge tone="amber">质检失效</Badge>
+                          : !b.allConfirmed
+                            ? <Badge tone="red">待重新确认</Badge>
+                            : <Badge tone="amber">待质检</Badge>}
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="tag-editor">
+                <h3>标签与分发级</h3>
+                <div className="tag-options">{(['合同问题', '设备缺陷', '现场安全', '损害赔偿', '仅律师可见']).map((tag, index) => <span key={tag} className={index < 3 ? 'selected' : ''}>{tag}</span>)}</div>
+                <label>导出清单说明<textarea defaultValue="按案卷编号升序导出，保留去密版本、操作者与审批时间。" /></label>
+                <Button>保存批次设置</Button>
+              </div>
+            </>
+          )}
+        </Card>
+        <Card className="batch-summary">
+          <div className="side-label">当前批次摘要</div>
+          <strong>{activeBatch.name}</strong>
+          <dl>
+            <div><dt>文档</dt><dd>{batchDocs.length}</dd></div>
+            <div><dt>页数</dt><dd>{batchDocs.reduce((sum, doc) => sum + doc.pages, 0)}</dd></div>
+            <div><dt>基线状态</dt><dd>{activeBatch.manifest ? '已冻结发出' : baselineReady ? '完整可发出' : '待复核'}</dd></div>
+            <div><dt>风险项</dt><dd>{activeBatch.manifest ? diverged.length : batchDocs.filter((d) => !docBaseline(activeBatch, d).ready).length}</dd></div>
+          </dl>
+          {!activeBatch.manifest && !baselineReady && (
+            <div className="summary-note"><AlertTriangle size={15} /><span>发布基线不完整，存在未重新确认或质检未通过的文档，不能出清单。</span></div>
+          )}
+          {activeBatch.manifest && diverged.length > 0 && (
+            <div className="summary-note diverge"><AlertTriangle size={15} /><span>冻结清单与当前内容有 {diverged.length} 处分歧，影响已标出。</span></div>
+          )}
+          {activeBatch.manifest && diverged.length === 0 && (
+            <div className="summary-note ok"><CheckCircle2 size={15} /><span>清单已冻结发出，内容未再变更。</span></div>
+          )}
+        </Card>
       </div>
     </div>
   );
